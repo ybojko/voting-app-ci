@@ -1,0 +1,110 @@
+name: Reusable Docker Build & Push to ECR
+
+on:
+  workflow_call:
+    inputs:
+      service-name:
+        required: true
+        type: string
+        description: "Service name (vote, result, worker)"
+      context:
+        required: true
+        type: string
+        description: "Docker build context directory"
+      dockerfile:
+        required: false
+        type: string
+        default: "Dockerfile"
+        description: "Dockerfile path relative to context"
+      platforms:
+        required: false
+        type: string
+        default: "linux/amd64"
+        description: "Comma-separated build platforms"
+    secrets:
+      GIT_OPS_TOKEN:
+        required: true
+        description: "PAT with contents:write on ybojko/voting-app-gitops"
+
+jobs:
+  build-and-push:
+    name: Build & Push ${{ inputs.service-name }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::522868276919:role/github-actions-ecr-push
+          aws-region: eu-central-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Generate image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.login-ecr.outputs.registry }}/voting-app-${{ inputs.service-name }}
+          tags: |
+            type=raw,value=sha-${{ github.sha }}-${{ github.run_attempt }}
+            type=raw,value=latest,enable=${{ github.ref_name == github.event.repository.default_branch }}
+
+      - name: Build and push to ECR
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.context }}/${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Patch GitOps repo with new tag
+        if: github.ref_name == github.event.repository.default_branch
+        env:
+          GH_TOKEN: ${{ secrets.GIT_OPS_TOKEN }}
+          SERVICE: ${{ inputs.service-name }}
+          NEW_TAG: sha-${{ github.sha }}-${{ github.run_attempt }}
+        run: |
+          git clone https://x-access-token:${GH_TOKEN}@github.com/ybojko/voting-app-gitops.git /tmp/gitops
+          cd /tmp/gitops
+
+          # Update application YAML
+          APP_FILE="apps/${SERVICE}-application.yaml"
+          if [ -f "$APP_FILE" ]; then
+            sed -i "s|tag: .*|tag: ${NEW_TAG}|" "$APP_FILE"
+            echo "Patched $APP_FILE → tag: $NEW_TAG"
+          fi
+
+          # Update helm chart values.yaml
+          VALUES_FILE="helm-charts/${SERVICE}/values.yaml"
+          if [ -f "$VALUES_FILE" ]; then
+            sed -i "s|tag: .*|tag: ${NEW_TAG}|" "$VALUES_FILE"
+            echo "Patched $VALUES_FILE → tag: $NEW_TAG"
+          fi
+
+          git config user.name "voting-app-ci"
+          git config user.email "ci@voting-app.dev"
+
+          if git diff --quiet; then
+            echo "No changes to commit"
+          else
+            git add -A
+            git commit -m "chore(${SERVICE}): bump image tag to ${NEW_TAG}
+
+            Co-authored-by: CommandCodeBot <noreply@commandcode.ai>"
+            git push
+          fi
