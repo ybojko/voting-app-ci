@@ -1,4 +1,4 @@
-name: Reusable Docker Build & Push to ECR
+name: Reusable Docker Build & Push to GHCR
 
 on:
   workflow_call:
@@ -19,7 +19,7 @@ on:
       platforms:
         required: false
         type: string
-        default: "linux/amd64"
+        default: "linux/amd64,linux/arm64"
         description: "Comma-separated build platforms"
     secrets:
       GIT_OPS_TOKEN:
@@ -32,21 +32,18 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      id-token: write
+      packages: write
 
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
         with:
-          role-to-assume: arn:aws:iam::522868276919:role/github-actions-ecr-push
-          aws-region: eu-central-1
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -55,12 +52,12 @@ jobs:
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ${{ steps.login-ecr.outputs.registry }}/voting-app-${{ inputs.service-name }}
+          images: ghcr.io/${{ github.repository_owner }}/voting-app-${{ inputs.service-name }}
           tags: |
             type=raw,value=sha-${{ github.sha }}-${{ github.run_attempt }}
             type=raw,value=latest,enable=${{ github.ref_name == github.event.repository.default_branch }}
 
-      - name: Build and push to ECR
+      - name: Build and push to GHCR
         uses: docker/build-push-action@v6
         with:
           context: ${{ inputs.context }}
@@ -79,21 +76,19 @@ jobs:
           SERVICE: ${{ inputs.service-name }}
           NEW_TAG: sha-${{ github.sha }}-${{ github.run_attempt }}
         run: |
-          git clone https://x-access-token:${GH_TOKEN}@github.com/ybojko/voting-app-gitops.git /tmp/gitops
+          git clone https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository_owner }}/voting-app-gitops.git /tmp/gitops
           cd /tmp/gitops
 
-          # Update application YAML
           APP_FILE="apps/${SERVICE}-application.yaml"
           if [ -f "$APP_FILE" ]; then
             sed -i "s|tag: .*|tag: ${NEW_TAG}|" "$APP_FILE"
-            echo "Patched $APP_FILE → tag: $NEW_TAG"
+            echo "Patched $APP_FILE -> tag: $NEW_TAG"
           fi
 
-          # Update helm chart values.yaml
           VALUES_FILE="helm-charts/${SERVICE}/values.yaml"
           if [ -f "$VALUES_FILE" ]; then
             sed -i "s|tag: .*|tag: ${NEW_TAG}|" "$VALUES_FILE"
-            echo "Patched $VALUES_FILE → tag: $NEW_TAG"
+            echo "Patched $VALUES_FILE -> tag: $NEW_TAG"
           fi
 
           git config user.name "voting-app-ci"
